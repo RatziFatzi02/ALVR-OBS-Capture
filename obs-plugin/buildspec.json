@@ -1,0 +1,13 @@
+{
+    "name": "alvr-capture",
+    "displayName": "ALVR Capture",
+    "version": "0.1.0",
+    "author": "RatziFatzi",
+    "website": "https://github.com/RatziFatzi02/ALVR-OBS-Capture",
+    "email": "",
+    "platformConfig": {
+        "windows": {
+            "arch": "x64"
+        }
+    }
+}

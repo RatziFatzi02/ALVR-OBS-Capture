@@ -1,0 +1,574 @@
+mod graphics;
+mod props;
+mod tracking;
+
+#[allow(
+    non_camel_case_types,
+    non_upper_case_globals,
+    dead_code,
+    non_snake_case,
+    clippy::unseparated_literal_suffix
+)]
+mod bindings {
+    include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
+}
+use bindings::*;
+
+use alvr_common::{
+    error,
+    once_cell::sync::Lazy,
+    parking_lot::{Mutex, RwLock},
+    settings_schema::Switch,
+    warn, BUTTON_INFO, HAND_LEFT_ID, HAND_RIGHT_ID, HAND_TRACKER_LEFT_ID, HAND_TRACKER_RIGHT_ID,
+    HEAD_ID,
+};
+use alvr_filesystem as afs;
+use alvr_packets::{ButtonValue, Haptics};
+use alvr_server_core::{HandType, ServerCoreContext, ServerCoreEvent};
+use alvr_session::{CodecType, ControllersConfig};
+use std::{
+    ffi::{c_char, c_void, CString, OsStr},
+    ptr,
+    sync::{mpsc, Once},
+    thread,
+    time::{Duration, Instant},
+};
+
+static SERVER_CORE_CONTEXT: Lazy<RwLock<Option<ServerCoreContext>>> =
+    Lazy::new(|| RwLock::new(None));
+static EVENT_LOOP_HANDLE: Lazy<Mutex<Option<thread::JoinHandle<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+static IDLE_INIT_HANDLE: Lazy<Mutex<Option<thread::JoinHandle<()>>>> =
+    Lazy::new(|| Mutex::new(None));
+static FACTORY_INIT_DATA: Lazy<Mutex<Option<FactoryInitData>>> = Lazy::new(|| Mutex::new(None));
+
+struct FactoryInitData {
+    filesystem_layout: afs::Layout,
+    early_hmd_initialization: bool,
+}
+
+fn event_loop(events_receiver: mpsc::Receiver<ServerCoreEvent>) {
+    let handle = thread::spawn(move || {
+        if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+            context.start_connection();
+        }
+
+        let mut last_resync = Instant::now();
+        loop {
+            let event = match events_receiver.recv_timeout(Duration::from_millis(5)) {
+                Ok(event) => event,
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+
+            match event {
+                ServerCoreEvent::SetOpenvrProperty { device_id, prop } => {
+                    props::set_openvr_prop(None, device_id, prop)
+                }
+                ServerCoreEvent::ClientConnected => unsafe {
+                    if InitializeStreaming() {
+                        RequestDriverResync();
+                    } else {
+                        SERVER_CORE_CONTEXT.write().take();
+
+                        ShutdownSteamvr();
+                    }
+                },
+
+                ServerCoreEvent::ClientDisconnected => unsafe { DeinitializeStreaming() },
+                ServerCoreEvent::Battery(info) => unsafe {
+                    SetBattery(info.device_id, info.gauge_value, info.is_plugged)
+                },
+                ServerCoreEvent::PlayspaceSync(bounds) => unsafe {
+                    SetChaperoneArea(bounds.x, bounds.y)
+                },
+                ServerCoreEvent::ViewsConfig(config) => unsafe {
+                    SetViewsConfig(FfiViewsConfig {
+                        fov: [
+                            FfiFov {
+                                left: config.fov[0].left,
+                                right: config.fov[0].right,
+                                up: config.fov[0].up,
+                                down: config.fov[0].down,
+                            },
+                            FfiFov {
+                                left: config.fov[1].left,
+                                right: config.fov[1].right,
+                                up: config.fov[1].up,
+                                down: config.fov[1].down,
+                            },
+                        ],
+                        // todo: send full matrix to steamvr
+                        ipd_m: config.local_view_transforms[1].position.x
+                            - config.local_view_transforms[0].position.x,
+                    });
+                },
+                ServerCoreEvent::Tracking { sample_timestamp } => {
+                    let headset_config = &alvr_server_core::settings().headset;
+
+                    let controllers_config = headset_config.controllers.clone().into_option();
+                    let track_body = headset_config.body_tracking.enabled();
+
+                    let tracked = controllers_config.as_ref().is_some_and(|c| c.tracked);
+
+                    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+                        let controllers_pose_time_offset = context.get_tracker_pose_time_offset();
+
+                        let ffi_head_motion = context
+                            .get_device_motion(*HEAD_ID, sample_timestamp)
+                            .map_or_else(FfiDeviceMotion::default, |m| {
+                                tracking::to_ffi_motion(*HEAD_ID, m)
+                            });
+                        let ffi_left_controller_motion = context
+                            .get_device_motion(*HAND_LEFT_ID, sample_timestamp)
+                            .map(|m| tracking::to_ffi_motion(*HAND_LEFT_ID, m))
+                            .filter(|_| tracked);
+                        let ffi_right_controller_motion = context
+                            .get_device_motion(*HAND_RIGHT_ID, sample_timestamp)
+                            .map(|m| tracking::to_ffi_motion(*HAND_RIGHT_ID, m))
+                            .filter(|_| tracked);
+
+                        let (
+                            ffi_left_hand_skeleton,
+                            ffi_right_hand_skeleton,
+                            use_separate_hand_trackers,
+                            predict_hand_skeleton,
+                        ) = if let Some(ControllersConfig {
+                            hand_skeleton: Switch::Enabled(hand_skeleton_config),
+                            ..
+                        }) = controllers_config
+                        {
+                            let left_hand_skeleton = context
+                                .get_hand_skeleton(HandType::Left, sample_timestamp)
+                                .map(|s| {
+                                    tracking::to_openvr_ffi_hand_skeleton(
+                                        headset_config,
+                                        *HAND_LEFT_ID,
+                                        &s,
+                                    )
+                                });
+                            let right_hand_skeleton = context
+                                .get_hand_skeleton(HandType::Right, sample_timestamp)
+                                .map(|s| {
+                                    tracking::to_openvr_ffi_hand_skeleton(
+                                        headset_config,
+                                        *HAND_RIGHT_ID,
+                                        &s,
+                                    )
+                                });
+
+                            (
+                                tracked.then_some(left_hand_skeleton).flatten(),
+                                tracked.then_some(right_hand_skeleton).flatten(),
+                                hand_skeleton_config.steamvr_input_2_0,
+                                hand_skeleton_config.predict,
+                            )
+                        } else {
+                            (None, None, false, false)
+                        };
+
+                        let ffi_left_hand_data = FfiHandData {
+                            controllerMotion: if let Some(motion) = &ffi_left_controller_motion {
+                                motion
+                            } else {
+                                ptr::null()
+                            },
+                            handSkeleton: if let Some(skeleton) = &ffi_left_hand_skeleton {
+                                skeleton
+                            } else {
+                                ptr::null()
+                            },
+                            isHandTracker: use_separate_hand_trackers
+                                && ffi_left_controller_motion.is_none()
+                                && ffi_left_hand_skeleton.is_some(),
+                            predictHandSkeleton: predict_hand_skeleton,
+                        };
+                        let ffi_right_hand_data = FfiHandData {
+                            controllerMotion: if let Some(motion) = &ffi_right_controller_motion {
+                                motion
+                            } else {
+                                ptr::null()
+                            },
+                            handSkeleton: if let Some(skeleton) = &ffi_right_hand_skeleton {
+                                skeleton
+                            } else {
+                                ptr::null()
+                            },
+                            isHandTracker: use_separate_hand_trackers
+                                && ffi_right_controller_motion.is_none()
+                                && ffi_right_hand_skeleton.is_some(),
+                            predictHandSkeleton: predict_hand_skeleton,
+                        };
+
+                        let ffi_body_tracker_motions = if track_body {
+                            tracking::BODY_TRACKER_IDS
+                                .iter()
+                                .filter_map(|id| {
+                                    Some(tracking::to_ffi_motion(
+                                        *id,
+                                        context.get_device_motion(*id, sample_timestamp)?,
+                                    ))
+                                })
+                                .collect::<Vec<_>>()
+                        } else {
+                            vec![]
+                        };
+
+                        // There are two pairs of controllers/hand tracking devices registered in
+                        // OpenVR, two lefts and two rights. If enabled with use_separate_hand_trackers,
+                        // we select at runtime which device to use (selected for left and right hand
+                        // independently. Selection is done by setting deviceIsConnected.
+                        unsafe {
+                            SetTracking(
+                                sample_timestamp.as_nanos() as _,
+                                controllers_pose_time_offset.as_secs_f32(),
+                                ffi_head_motion,
+                                ffi_left_hand_data,
+                                ffi_right_hand_data,
+                                ffi_body_tracker_motions.as_ptr(),
+                                ffi_body_tracker_motions.len() as i32,
+                            )
+                        };
+                    }
+                }
+                ServerCoreEvent::Buttons(entries) => {
+                    for entry in entries {
+                        let value = match entry.value {
+                            ButtonValue::Binary(value) => FfiButtonValue {
+                                type_: FfiButtonType_BUTTON_TYPE_BINARY,
+                                __bindgen_anon_1: FfiButtonValue__bindgen_ty_1 {
+                                    binary: value.into(),
+                                },
+                            },
+
+                            ButtonValue::Scalar(value) => FfiButtonValue {
+                                type_: FfiButtonType_BUTTON_TYPE_SCALAR,
+                                __bindgen_anon_1: FfiButtonValue__bindgen_ty_1 { scalar: value },
+                            },
+                        };
+                        unsafe { SetButton(entry.path_id, value) };
+                    }
+                }
+                ServerCoreEvent::RequestIDR => unsafe { RequestIDR() },
+                ServerCoreEvent::CaptureFrame => unsafe { CaptureFrame() },
+                ServerCoreEvent::GameRenderLatencyFeedback(game_latency) => {
+                    if cfg!(target_os = "linux") && game_latency.as_secs_f32() > 0.25 {
+                        let now = Instant::now();
+                        if now.saturating_duration_since(last_resync).as_secs_f32() > 0.1 {
+                            last_resync = now;
+                            warn!("Desync detected. Attempting recovery.");
+                            unsafe {
+                                RequestDriverResync();
+                            }
+                        }
+                    }
+                }
+                ServerCoreEvent::ShutdownPending => {
+                    SERVER_CORE_CONTEXT.write().take();
+
+                    unsafe { ShutdownSteamvr() };
+                }
+                ServerCoreEvent::RestartPending => {
+                    if let Some(context) = SERVER_CORE_CONTEXT.write().take() {
+                        context.restart();
+                    }
+
+                    unsafe { ShutdownSteamvr() };
+                }
+            }
+        }
+
+        unsafe { ShutdownOpenvrClient() };
+    });
+    *EVENT_LOOP_HANDLE.lock() = Some(handle);
+}
+
+#[export_name = "DriverReadyIdle"]
+extern "C" fn driver_ready_idle(set_default_chap: bool) {
+    let handle = thread::spawn(move || {
+        unsafe { InitOpenvrClient() };
+
+        if set_default_chap {
+            // call this when inside a new thread. Calling this on the parent thread will crash SteamVR
+            unsafe {
+                SetChaperoneArea(2.0, 2.0);
+            }
+        }
+    });
+    *IDLE_INIT_HANDLE.lock() = Some(handle);
+}
+
+/// # Safety
+/// `instance_ptr` is a valid pointer to a `TrackedDevice` instance
+#[export_name = "RegisterButtons"]
+pub unsafe extern "C" fn register_buttons(instance_ptr: *mut c_void, device_id: u64) {
+    let mapped_device_id = if device_id == *HAND_TRACKER_LEFT_ID {
+        *HAND_LEFT_ID
+    } else if device_id == *HAND_TRACKER_RIGHT_ID {
+        *HAND_RIGHT_ID
+    } else {
+        device_id
+    };
+
+    for button_id in alvr_server_core::registered_button_set() {
+        if let Some(info) = BUTTON_INFO.get(&button_id) {
+            if info.device_id == mapped_device_id {
+                unsafe { RegisterButton(instance_ptr, button_id) };
+            }
+        } else {
+            error!("Cannot register unrecognized button ID {button_id}");
+        }
+    }
+}
+
+#[export_name = "HapticsSend"]
+extern "C" fn send_haptics(device_id: u64, duration_s: f32, frequency: f32, amplitude: f32) {
+    if let Ok(duration) = Duration::try_from_secs_f32(duration_s) {
+        if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+            context.send_haptics(Haptics {
+                device_id,
+                duration,
+                frequency,
+                amplitude,
+            });
+        }
+    }
+}
+
+#[export_name = "SetVideoConfigNals"]
+extern "C" fn set_video_config_nals(buffer_ptr: *const u8, len: i32, codec: i32) {
+    let codec = if codec == 0 {
+        CodecType::H264
+    } else if codec == 1 {
+        CodecType::Hevc
+    } else {
+        CodecType::AV1
+    };
+
+    let mut config_buffer = vec![0; len as usize];
+
+    unsafe { ptr::copy_nonoverlapping(buffer_ptr, config_buffer.as_mut_ptr(), len as usize) };
+
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.set_video_config_nals(config_buffer, codec);
+    }
+}
+
+#[export_name = "VideoSend"]
+extern "C" fn send_video(timestamp_ns: u64, buffer_ptr: *mut u8, len: i32, is_idr: bool) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        let buffer = unsafe { std::slice::from_raw_parts(buffer_ptr, len as usize) };
+        context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
+    }
+}
+
+#[export_name = "GetDynamicEncoderParams"]
+extern "C" fn get_dynamic_encoder_params() -> FfiDynamicEncoderParams {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        if let Some(params) = context.get_dynamic_encoder_params() {
+            FfiDynamicEncoderParams {
+                updated: 1,
+                bitrate_bps: params.bitrate_bps as u64,
+                framerate: params.framerate,
+            }
+        } else {
+            FfiDynamicEncoderParams::default()
+        }
+    } else {
+        FfiDynamicEncoderParams::default()
+    }
+}
+
+#[export_name = "ReportComposed"]
+extern "C" fn report_composed(timestamp_ns: u64, offset_ns: u64) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.report_composed(
+            Duration::from_nanos(timestamp_ns),
+            Duration::from_nanos(offset_ns),
+        );
+    }
+}
+
+#[export_name = "ReportPresent"]
+extern "C" fn report_present(timestamp_ns: u64, offset_ns: u64) {
+    if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+        context.report_present(
+            Duration::from_nanos(timestamp_ns),
+            Duration::from_nanos(offset_ns),
+        );
+    }
+}
+
+#[export_name = "WaitForVSync"]
+extern "C" fn wait_for_vsync() {
+    // Default 120Hz-ish wait if StatisticsManager isn't up.
+    // We use 120Hz-ish so that SteamVR doesn't accidentally get
+    // any weird ideas about our display Hz with its frame pacing.
+    static PRE_HEADSET_STATS_WAIT_INTERVAL: Duration = Duration::from_millis(8);
+
+    // NB: don't sleep while locking SERVER_DATA_MANAGER or SERVER_CORE_CONTEXT
+    let sleep_duration = SERVER_CORE_CONTEXT
+        .read()
+        .as_ref()
+        .and_then(|ctx| ctx.duration_until_next_vsync());
+
+    if let Some(duration) = sleep_duration {
+        if alvr_server_core::settings()
+            .video
+            .enforce_server_frame_pacing
+        {
+            thread::sleep(duration);
+        } else {
+            thread::yield_now();
+        }
+    } else {
+        // StatsManager isn't up because the headset hasn't connected,
+        // safety fallback to prevent deadlocking.
+        thread::sleep(PRE_HEADSET_STATS_WAIT_INTERVAL);
+    }
+}
+
+#[export_name = "ShutdownRuntime"]
+pub extern "C" fn shutdown_driver() {
+    SERVER_CORE_CONTEXT.write().take();
+
+    // Join driver threads so the DLL cannot be unloaded while they still execute its code.
+    if let Some(handle) = EVENT_LOOP_HANDLE.lock().take() {
+        handle.join().ok();
+    }
+    if let Some(handle) = IDLE_INIT_HANDLE.lock().take() {
+        handle.join().ok();
+    }
+}
+
+/// This is the SteamVR/OpenVR entry point
+/// # Safety
+#[no_mangle]
+pub unsafe extern "C" fn HmdDriverFactory(
+    interface_name: *const c_char,
+    return_code: *mut i32,
+) -> *mut c_void {
+    let Ok(driver_dir) = alvr_server_io::get_driver_dir_from_registered() else {
+        return ptr::null_mut();
+    };
+    let Some(filesystem_layout) =
+        alvr_filesystem::filesystem_layout_from_openvr_driver_root_dir(&driver_dir)
+    else {
+        return ptr::null_mut();
+    };
+
+    let dashboard_process_paths = sysinfo::System::new_all()
+        .processes_by_name(OsStr::new(&afs::dashboard_fname()))
+        .filter_map(|proc| Some(proc.exe()?.to_owned()))
+        .collect::<Vec<_>>();
+
+    // Check that there is no active dashboard instance not part of this driver installation
+    // Note: if the iterator is empty, `all()` returns true
+    if !dashboard_process_paths
+        .iter()
+        .all(|path| *path == filesystem_layout.dashboard_exe())
+    {
+        return ptr::null_mut();
+    }
+
+    // Defer all runtime work to DriverProvider::Init(). Steam can call this factory merely to
+    // enumerate drivers, in which case starting a runtime or worker thread is unsafe.
+    *FACTORY_INIT_DATA.lock() = Some(FactoryInitData {
+        filesystem_layout,
+        early_hmd_initialization: !dashboard_process_paths.is_empty(),
+    });
+
+    CppOpenvrEntryPoint(interface_name, return_code)
+}
+
+#[export_name = "LogError"]
+unsafe extern "C" fn log_error(string_ptr: *const c_char) {
+    alvr_server_core::alvr_error(string_ptr);
+}
+
+#[export_name = "LogWarn"]
+unsafe extern "C" fn log_warn(string_ptr: *const c_char) {
+    alvr_server_core::alvr_warn(string_ptr);
+}
+
+#[export_name = "LogInfo"]
+unsafe extern "C" fn log_info(string_ptr: *const c_char) {
+    alvr_server_core::alvr_info(string_ptr);
+}
+
+#[export_name = "LogDebug"]
+unsafe extern "C" fn log_debug(string_ptr: *const c_char) {
+    alvr_server_core::alvr_dbg_server_impl(string_ptr);
+}
+
+#[export_name = "LogEncoder"]
+unsafe extern "C" fn log_encoder(string_ptr: *const c_char) {
+    alvr_server_core::alvr_dbg_encoder(string_ptr);
+}
+
+#[export_name = "LogPeriodically"]
+unsafe extern "C" fn log_periodically(tag_ptr: *const c_char, string_ptr: *const c_char) {
+    alvr_server_core::alvr_log_periodically(tag_ptr, string_ptr);
+}
+
+#[export_name = "PathStringToHash"]
+unsafe extern "C" fn path_string_to_hash(path: *const c_char) -> u64 {
+    alvr_server_core::alvr_path_to_id(path)
+}
+
+#[export_name = "GetSerialNumber"]
+extern "C" fn get_serial_number(device_id: u64, out_str: *mut c_char) -> u64 {
+    props::get_serial_number(device_id, out_str)
+}
+
+#[export_name = "SetOpenvrProps"]
+extern "C" fn set_openvr_props(instance_ptr: *mut c_void, device_id: u64) {
+    props::set_device_openvr_props(instance_ptr, device_id)
+}
+
+// Called from DriverProvider::Init().
+#[export_name = "InitializeRuntime"]
+pub extern "C" fn initialize_runtime() {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let Some(init_data) = FACTORY_INIT_DATA.lock().take() else {
+            return;
+        };
+        let filesystem_layout = init_data.filesystem_layout;
+
+        alvr_server_core::initialize_environment(filesystem_layout.clone());
+
+        let log_to_disk = alvr_server_core::settings().extra.logging.log_to_disk;
+
+        alvr_server_core::init_logging(
+            log_to_disk.then(|| filesystem_layout.session_log()),
+            Some(filesystem_layout.crash_log()),
+        );
+
+        unsafe {
+            g_sessionPath = CString::new(filesystem_layout.session().to_string_lossy().to_string())
+                .unwrap()
+                .into_raw();
+            g_driverRootDir = CString::new(
+                filesystem_layout
+                    .openvr_driver_root_dir
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .unwrap()
+            .into_raw();
+        };
+
+        graphics::initialize_shaders();
+
+        unsafe {
+            CppInit(init_data.early_hmd_initialization);
+        }
+
+        let (context, events_receiver) = ServerCoreContext::new();
+
+        *SERVER_CORE_CONTEXT.write() = Some(context);
+
+        event_loop(events_receiver);
+    });
+}

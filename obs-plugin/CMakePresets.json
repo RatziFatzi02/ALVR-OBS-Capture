@@ -1,0 +1,27 @@
+{
+    "version": 8,
+    "cmakeMinimumRequired": {
+        "major": 3,
+        "minor": 28,
+        "patch": 0
+    },
+    "configurePresets": [
+        {
+            "name": "windows-x64",
+            "displayName": "Windows x64",
+            "generator": "Visual Studio 17 2022",
+            "architecture": "x64",
+            "binaryDir": "${sourceDir}/build",
+            "cacheVariables": {
+                "CMAKE_INSTALL_PREFIX": "${sourceDir}/outputs/install/alvr-capture"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "windows-x64",
+            "configurePreset": "windows-x64",
+            "configuration": "RelWithDebInfo"
+        }
+    ]
+}

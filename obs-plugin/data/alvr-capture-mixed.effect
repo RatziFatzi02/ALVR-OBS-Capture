@@ -1,0 +1,48 @@
+uniform float4x4 ViewProj;
+uniform texture2d left_image;
+uniform texture2d right_image;
+uniform float2 uv_mul;
+uniform float2 uv_add;
+uniform float left_dominant;
+
+sampler_state texture_sampler {
+	Filter = Linear;
+	AddressU = Clamp;
+	AddressV = Clamp;
+};
+
+struct VertInOut {
+	float4 pos : POSITION;
+	float2 uv : TEXCOORD0;
+};
+
+VertInOut VSDefault(VertInOut vert_in)
+{
+	VertInOut vert_out;
+	vert_out.pos = mul(float4(vert_in.pos.xyz, 1.0), ViewProj);
+	vert_out.uv = vert_in.uv;
+	return vert_out;
+}
+
+float4 PSMixedEyes(VertInOut vert_in) : TARGET
+{
+	float2 source_uv = vert_in.uv * uv_mul + uv_add;
+	float3 left = left_image.Sample(texture_sampler, source_uv).rgb;
+	float3 right = right_image.Sample(texture_sampler, source_uv).rgb;
+
+	// SteamVR-style dominant view: preserve the secondary outer edge and
+	// blend over a central band into the selected dominant eye.
+	float right_dominant = smoothstep(0.25, 0.45, vert_in.uv.x);
+	float left_dominant_weight = 1.0 - smoothstep(0.55, 0.75, vert_in.uv.x);
+	float dominant_weight = left_dominant > 0.5 ? left_dominant_weight : right_dominant;
+	return float4(lerp(right, left, dominant_weight), 1.0);
+}
+
+technique Draw
+{
+	pass
+	{
+		vertex_shader = VSDefault(vert_in);
+		pixel_shader = PSMixedEyes(vert_in);
+	}
+}
