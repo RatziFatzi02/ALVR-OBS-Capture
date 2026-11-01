@@ -105,7 +105,8 @@ VideoEncoderAMF::VideoEncoderAMF(std::shared_ptr<CD3DRender> d3dRender, int widt
     , m_bitrateInMBits(30)
     , m_surfaceFormat(amf::AMF_SURFACE_RGBA)
     , m_use10bit(Settings::Instance().m_use10bitEncoder)
-    , m_hasQueryTimeout(false) {
+    , m_hasQueryTimeout(false)
+    , m_hasPreAnalysis(false) {
     if (Settings::Instance().m_enableHdr) {
         // Bypass preprocessor and converters for HDR, since it will already be YUV
         m_surfaceFormat = m_use10bit ? amf::AMF_SURFACE_P010 : amf::AMF_SURFACE_NV12;
@@ -150,7 +151,18 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
 
     switch (codec) {
     case ALVR_CODEC_H264: {
-        amfEncoder->SetProperty(AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY);
+        AMF_THROW_IF(amfEncoder->SetProperty(
+            AMF_VIDEO_ENCODER_USAGE, AMF_VIDEO_ENCODER_USAGE_ULTRA_LOW_LATENCY
+        ));
+        amf_bool defaultSkip = false;
+        AMF_RESULT defaultSkipResult = amfEncoder->GetProperty(
+            AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, &defaultSkip
+        );
+        Info(
+            "[AMF-RC] H.264 preset frame-skip=%d, query status=%d.\n",
+            defaultSkip,
+            defaultSkipResult
+        );
         switch (Settings::Instance().m_h264Profile) {
         case ALVR_H264_PROFILE_BASELINE:
             amfEncoder->SetProperty(AMF_VIDEO_ENCODER_PROFILE, AMF_VIDEO_ENCODER_PROFILE_BASELINE);
@@ -221,6 +233,7 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
             caps->GetProperty(AMF_VIDEO_ENCODER_CAP_PRE_ANALYSIS, &m_hasPreAnalysis);
             caps->GetProperty(AMF_VIDEO_ENCODER_CAPS_QUERY_TIMEOUT_SUPPORT, &m_hasQueryTimeout);
         }
+        Debug("AMF H.264 query timeout support: %d.\n", m_hasQueryTimeout);
 
         if (Settings::Instance().m_enableAmfPreAnalysis) {
             if (!Settings::Instance().m_useAmfPreproc || Settings::Instance().m_use10bitEncoder) {
@@ -310,9 +323,20 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
 
         amfEncoder->SetProperty(AMF_VIDEO_ENCODER_MAX_NUM_REFRAMES, 0);
 
+        // The runtime's usage preset may allow rate control to emit skipped pictures.
+        // PCVR needs fresh pictures even when the requested bitrate cannot be met.
+        AMF_THROW_IF(
+            amfEncoder->SetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, false)
+        );
+
         if (m_hasQueryTimeout) {
-            amfEncoder->SetProperty(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, 1000); // 1s timeout
+            AMF_RESULT result = amfEncoder->SetProperty(AMF_VIDEO_ENCODER_QUERY_TIMEOUT, 1000);
+            if (result != AMF_OK) {
+                Warn("AMF H.264 query timeout could not be enabled (status %d).\n", result);
+                m_hasQueryTimeout = false;
+            }
         }
+        break;
     }
     case ALVR_CODEC_HEVC: {
         amfEncoder->SetProperty(
@@ -484,8 +508,13 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
         amfEncoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_MAX_NUM_REFRAMES, 0);
 
         if (m_hasQueryTimeout) {
-            amfEncoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, 1000); // 1s timeout
+            AMF_RESULT result = amfEncoder->SetProperty(AMF_VIDEO_ENCODER_HEVC_QUERY_TIMEOUT, 1000);
+            if (result != AMF_OK) {
+                Warn("AMF HEVC query timeout could not be enabled (status %d).\n", result);
+                m_hasQueryTimeout = false;
+            }
         }
+        break;
     }
     case ALVR_CODEC_AV1: {
         amfEncoder->SetProperty(
@@ -607,8 +636,13 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
         m_hasQueryTimeout = true;
 
         if (m_hasQueryTimeout) {
-            amfEncoder->SetProperty(AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT, 1000); // 1s timeout
+            AMF_RESULT result = amfEncoder->SetProperty(AMF_VIDEO_ENCODER_AV1_QUERY_TIMEOUT, 1000);
+            if (result != AMF_OK) {
+                Warn("AMF AV1 query timeout could not be enabled (status %d).\n", result);
+                m_hasQueryTimeout = false;
+            }
         }
+        break;
     }
     }
 
@@ -616,6 +650,16 @@ amf::AMFComponentPtr VideoEncoderAMF::MakeEncoder(
     AMF_THROW_IF(amfEncoder->Init(inputFormat, width, height));
 
     Debug("Initialized %s.\n", pCodec);
+
+    if (codec == ALVR_CODEC_H264) {
+        amf_bool skip = true;
+        AMF_THROW_IF(
+            amfEncoder->GetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, &skip)
+        );
+        if (skip) {
+            throw MakeException("AMF H.264 frame skipping remained enabled after initialization");
+        }
+    }
 
     return amfEncoder;
 }
@@ -689,6 +733,9 @@ void VideoEncoderAMF::Initialize() {
     m_amfComponents.emplace_back(MakeEncoder(
         inFormat, m_renderWidth, m_renderHeight, m_codec, m_refreshRate, m_bitrateInMBits
     ));
+    if (m_codec == ALVR_CODEC_H264) {
+        LogH264RateControlState("initialized");
+    }
 
     m_pipeline = new AMFPipeline();
     for (int i = 0; i < m_amfComponents.size() - 1; i++) {
@@ -733,11 +780,29 @@ void VideoEncoderAMF::Transmit(
     if (params.updated) {
         amf_int64 bitRateIn = params.bitrate_bps / params.framerate * m_refreshRate; // in bits
         if (m_codec == ALVR_CODEC_H264) {
-            m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitRateIn);
-            m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, bitRateIn);
-            m_amfComponents.back()->SetProperty(
+            AMF_RESULT targetResult
+                = m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, bitRateIn);
+            AMF_RESULT peakResult
+                = m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, bitRateIn);
+            AMF_RESULT vbvResult = m_amfComponents.back()->SetProperty(
                 AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, bitRateIn / m_refreshRate * 1.1
             );
+            bool failed = targetResult != AMF_OK || peakResult != AMF_OK || vbvResult != AMF_OK;
+            if (failed && !m_h264RateControlFailureReported) {
+                Warn(
+                    "[AMF-RC] H.264 bitrate update rejected: requested=%lld, target status=%d, "
+                    "peak status=%d, VBV status=%d.\n",
+                    bitRateIn,
+                    targetResult,
+                    peakResult,
+                    vbvResult
+                );
+            }
+            m_h264RateControlFailureReported = failed;
+            if (!m_loggedH264DynamicRateControl) {
+                LogH264RateControlState("first bitrate update");
+                m_loggedH264DynamicRateControl = true;
+            }
         } else {
             m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_HEVC_TARGET_BITRATE, bitRateIn);
             m_amfComponents.back()->SetProperty(AMF_VIDEO_ENCODER_HEVC_PEAK_BITRATE, bitRateIn);
@@ -766,6 +831,33 @@ void VideoEncoderAMF::Transmit(
 
     m_amfComponents.front()->SubmitInput(surface);
     m_pipeline->Run(m_hasQueryTimeout);
+}
+
+void VideoEncoderAMF::LogH264RateControlState(const char* phase) {
+    amf_bool skip = false, hrd = false;
+    amf_int64 target = 0, peak = 0, vbv = 0;
+    auto encoder = m_amfComponents.back();
+    AMF_RESULT skipResult
+        = encoder->GetProperty(AMF_VIDEO_ENCODER_RATE_CONTROL_SKIP_FRAME_ENABLE, &skip);
+    AMF_RESULT hrdResult = encoder->GetProperty(AMF_VIDEO_ENCODER_ENFORCE_HRD, &hrd);
+    AMF_RESULT targetResult = encoder->GetProperty(AMF_VIDEO_ENCODER_TARGET_BITRATE, &target);
+    AMF_RESULT peakResult = encoder->GetProperty(AMF_VIDEO_ENCODER_PEAK_BITRATE, &peak);
+    AMF_RESULT vbvResult = encoder->GetProperty(AMF_VIDEO_ENCODER_VBV_BUFFER_SIZE, &vbv);
+    Info(
+        "[AMF-RC] H.264 %s: skip=%d (%d), HRD=%d (%d), target=%lld (%d), "
+        "peak=%lld (%d), VBV=%lld (%d).\n",
+        phase,
+        skip,
+        skipResult,
+        hrd,
+        hrdResult,
+        target,
+        targetResult,
+        peak,
+        peakResult,
+        vbv,
+        vbvResult
+    );
 }
 
 void VideoEncoderAMF::Receive(AMFDataPtr data) {

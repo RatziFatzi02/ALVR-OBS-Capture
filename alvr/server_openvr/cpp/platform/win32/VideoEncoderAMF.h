@@ -111,6 +111,9 @@ private:
 
     bool m_hasQueryTimeout;
     bool m_hasPreAnalysis;
+    bool m_loggedH264DynamicRateControl = false;
+    bool m_h264RateControlFailureReported = false;
 
     void ApplyFrameProperties(const amf::AMFSurfacePtr& surface, bool insertIDR);
+    void LogH264RateControlState(const char* phase);
 };

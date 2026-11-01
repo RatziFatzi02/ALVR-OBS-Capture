@@ -17,6 +17,10 @@ ALVR never waits for OBS. If OBS occupies every slot, ALVR skips that capture co
 
 This fork also backports the shutdown changes from [ALVR PR #3333](https://github.com/alvr-org/ALVR/pull/3333) to the v20.14.1 interfaces. The backport joins the runtime threads before SteamVR unloads the driver DLL.
 
+### AMD H.264 streaming fix
+
+The Windows AMF encoder now explicitly disables rate-control frame skipping and checks the effective setting. Codec initialization no longer falls through into other codecs. See [the diagnosis and validation notes](docs/AMD-H264-FRAME-SKIPPING.md) for the evidence, short live-test results and remaining limits.
+
 ### OBS source plugin
 
 The plugin adds an **ALVR Capture** source. It reads the shared textures directly, without window capture, CPU readback or another encoder.
