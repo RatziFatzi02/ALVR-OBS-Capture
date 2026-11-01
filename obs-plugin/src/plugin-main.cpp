@@ -6,6 +6,9 @@
 
 #include "CapturePrototypeProtocol.h"
 #include "plugin-support.h"
+#include "OpenVRProjection.h"
+#include <graphics/vec4.h>
+#include <memory>
 
 #include <windows.h>
 
@@ -60,6 +63,10 @@ struct CaptureSlotTextures {
 
 struct AlvrCaptureData {
 	obs_source_t *source = nullptr;
+    std::shared_ptr<stereo::RuntimeProjection> projectionRuntime;
+    stereo::Projection projection;
+    std::atomic<float> convergence = 1.f;
+    std::atomic<float> mixedWidthScale = 1.f;
 	HANDLE mapping = nullptr;
 	CaptureControlBlock *control = nullptr;
 	HANDLE producerProcess = nullptr;
@@ -369,7 +376,8 @@ CropRect CustomCrop(const AlvrCaptureData *data, uint32_t width, uint32_t height
 
 CropRect EffectiveCrop(const AlvrCaptureData *data)
 {
-	const uint32_t width = NativeEyeWidth(data);
+	const bool mixed = data->eyeMode.load() == EyeMode::BothLeftDominant || data->eyeMode.load() == EyeMode::BothRightDominant;
+	const uint32_t width = mixed ? std::max(1u, static_cast<uint32_t>(NativeEyeWidth(data) * data->mixedWidthScale.load())) : NativeEyeWidth(data);
 	const uint32_t height = NativeEyeHeight(data);
 	switch (data->aspectCropMode.load()) {
 	case AspectCropMode::Aspect16x9:
@@ -435,8 +443,12 @@ void DrawMixedEyes(AlvrCaptureData *data, gs_texture_t *left, gs_texture_t *righ
 	               uint32_t outputWidth, uint32_t outputHeight)
 {
 	const EyeMode mode = data->eyeMode.load();
-	if (!data->mixedEyeEffect || !IsMixedEyeMode(mode)) {
-		DrawCroppedTexture(mode == EyeMode::BothLeftDominant ? left : right, sample, 0, outputWidth, outputHeight);
+	if (!data->mixedEyeEffect || !data->projection.valid || !IsMixedEyeMode(mode)) {
+        CropRect fallback = sample;
+        const float scale = data->mixedWidthScale.load();
+        fallback.x = static_cast<uint32_t>(sample.x / scale);
+        fallback.width = std::max(1u, static_cast<uint32_t>(sample.width / scale));
+        DrawCroppedTexture(mode == EyeMode::BothLeftDominant ? left : right, fallback, 0, outputWidth, outputHeight);
 		return;
 	}
 	const bool linearSrgb = gs_get_linear_srgb();
@@ -451,14 +463,20 @@ void DrawMixedEyes(AlvrCaptureData *data, gs_texture_t *left, gs_texture_t *righ
 		gs_effect_set_texture(leftImage, left);
 		gs_effect_set_texture(rightImage, right);
 	}
-	const vec2 uvMul = {static_cast<float>(sample.width) / NativeEyeWidth(data),
+	const float fullWidth = NativeEyeWidth(data) * data->mixedWidthScale.load();
+	const vec2 uvMul = {static_cast<float>(sample.width) / fullWidth,
 	                    static_cast<float>(sample.height) / NativeEyeHeight(data)};
-	const vec2 uvAdd = {static_cast<float>(sample.x) / NativeEyeWidth(data),
+	const vec2 uvAdd = {static_cast<float>(sample.x) / fullWidth,
 	                    static_cast<float>(sample.y) / NativeEyeHeight(data)};
 	gs_effect_set_vec2(gs_effect_get_param_by_name(data->mixedEyeEffect, "uv_mul"), &uvMul);
 	gs_effect_set_vec2(gs_effect_get_param_by_name(data->mixedEyeEffect, "uv_add"), &uvAdd);
 	gs_effect_set_float(gs_effect_get_param_by_name(data->mixedEyeEffect, "left_dominant"),
 	                    mode == EyeMode::BothLeftDominant ? 1.0f : 0.0f);
+    vec4 leftMap, rightMap;
+    stereo::EyeMap(data->projection, 0, leftMap.ptr);
+    stereo::EyeMap(data->projection, 1, rightMap.ptr);
+    gs_effect_set_vec4(gs_effect_get_param_by_name(data->mixedEyeEffect, "left_map"), &leftMap);
+    gs_effect_set_vec4(gs_effect_get_param_by_name(data->mixedEyeEffect, "right_map"), &rightMap);
 	while (gs_effect_loop(data->mixedEyeEffect, "Draw"))
 		gs_draw_sprite(nullptr, 0, outputWidth, outputHeight);
 	gs_enable_framebuffer_srgb(previousSrgb);
@@ -648,6 +666,7 @@ void ApplySettings(AlvrCaptureData *data, obs_data_t *settings)
 	data->cropBottom.store(ParseCropPixels(settings, "crop_bottom"));
 	data->zoomPercent.store(static_cast<uint32_t>(std::clamp<int64_t>(obs_data_get_int(settings, "zoom_percent"),
 		MIN_ZOOM_PERCENT, MAX_ZOOM_PERCENT)));
+    data->convergence.store(static_cast<float>(std::clamp(obs_data_get_double(settings, "stereo_distance"), .25, 20.)));
 	data->settingsVersion.fetch_add(1);
 }
 
@@ -655,6 +674,15 @@ void *SourceCreate(obs_data_t *settings, obs_source_t *source)
 {
 	auto *data = new AlvrCaptureData();
 	data->source = source;
+    char *runtimePath = obs_module_file("openvr_api.dll");
+    if (runtimePath) {
+        int size = MultiByteToWideChar(CP_UTF8, 0, runtimePath, -1, nullptr, 0);
+        std::wstring path(size, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, runtimePath, -1, path.data(), size);
+        static auto runtime = std::make_shared<stereo::RuntimeProjection>(path.c_str());
+        data->projectionRuntime = runtime;
+        bfree(runtimePath);
+    }
 	ApplySettings(data, settings);
 	LoadMixedEyeEffect(data);
 	return data;
@@ -692,6 +720,16 @@ uint32_t SourceHeight(void *rawData)
 void SourceRender(void *rawData, gs_effect_t *)
 {
 	auto *data = static_cast<AlvrCaptureData *>(rawData);
+    if (data->projectionRuntime) {
+        data->projectionRuntime->SetConvergence(data->convergence.load());
+        const auto previous = data->projection;
+        data->projection = data->projectionRuntime->Poll();
+        if (previous.valid != data->projection.valid ||
+            std::memcmp(previous.eyes, data->projection.eyes, sizeof(previous.eyes)) != 0)
+            data->settingsVersion.fetch_add(1);
+        const float scale = data->projection.valid ? data->projection.widthScale : 1.f;
+        if (data->mixedWidthScale.exchange(scale) != scale) data->settingsVersion.fetch_add(1);
+    }
 	if (EnsureMapping(data))
 		UpdateFrameCache(data);
 	DrawCachedFrame(data);
@@ -724,6 +762,7 @@ obs_properties_t *SourceProperties(void *rawData)
 	obs_property_list_add_string(eye, "Both Eyes - Left Dominant", "both_left_dominant");
 	obs_property_list_add_string(eye, "Both Eyes - Right Dominant", "both_right_dominant");
 	obs_property_list_add_string(eye, "Side-by-Side", "side_by_side");
+    obs_properties_add_float(properties, "stereo_distance", "Stereo alignment distance (m)", .25, 20., .05);
 	obs_property_t *aspect = obs_properties_add_list(properties, "aspect_crop", "Aspect / Crop Mode",
 		OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(aspect, "Original", "original");
@@ -751,6 +790,7 @@ obs_properties_t *SourceProperties(void *rawData)
 
 void SourceDefaults(obs_data_t *settings)
 {
+    obs_data_set_default_double(settings, "stereo_distance", 1.);
 	obs_data_set_default_string(settings, "eye", "right");
 	obs_data_set_default_string(settings, "dominant_eye", "right");
 	obs_data_set_default_string(settings, "aspect_crop", "original");

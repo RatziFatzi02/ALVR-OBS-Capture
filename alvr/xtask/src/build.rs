@@ -179,6 +179,21 @@ pub fn build_streamer(
         .unwrap();
     }
 
+    // Build the Windows-native capture preview next to the dashboard. It opens the same local
+    // D3D11/PCM mappings as the OBS plugin, so it does not add a second streamer path.
+    #[cfg(windows)]
+    {
+        let _push_guard = sh.push_dir(afs::crate_dir("dashboard").join("capture_preview"));
+        cmd!(sh, "cmd /c build.cmd").run().unwrap();
+        sh.copy_file(
+            "ALVR Capture Preview.exe",
+            build_layout
+                .executables_dir
+                .join("ALVR Capture Preview.exe"),
+        )
+        .unwrap();
+    }
+
     // copy dependencies
     if cfg!(windows) {
         sh.copy_file(
@@ -186,6 +201,11 @@ pub fn build_streamer(
             build_layout.openvr_driver_lib_dir(),
         )
         .unwrap();
+
+        sh.copy_file(
+            afs::workspace_dir().join("openvr/bin/win64/openvr_api.dll"),
+            build_layout.executables_dir.join("openvr_api.dll"),
+        ).unwrap();
 
         // Bring along the c++ runtime
         command::copy_recursive(

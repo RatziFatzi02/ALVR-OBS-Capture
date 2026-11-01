@@ -4,6 +4,8 @@ uniform texture2d right_image;
 uniform float2 uv_mul;
 uniform float2 uv_add;
 uniform float left_dominant;
+uniform float4 left_map;
+uniform float4 right_map;
 
 sampler_state texture_sampler {
 	Filter = Linear;
@@ -27,15 +29,18 @@ VertInOut VSDefault(VertInOut vert_in)
 float4 PSMixedEyes(VertInOut vert_in) : TARGET
 {
 	float2 source_uv = vert_in.uv * uv_mul + uv_add;
-	float3 left = left_image.Sample(texture_sampler, source_uv).rgb;
-	float3 right = right_image.Sample(texture_sampler, source_uv).rgb;
-
-	// SteamVR-style dominant view: preserve the secondary outer edge and
-	// blend over a central band into the selected dominant eye.
-	float right_dominant = smoothstep(0.25, 0.45, vert_in.uv.x);
-	float left_dominant_weight = 1.0 - smoothstep(0.55, 0.75, vert_in.uv.x);
-	float dominant_weight = left_dominant > 0.5 ? left_dominant_weight : right_dominant;
-	return float4(lerp(right, left, dominant_weight), 1.0);
+    float2 lu = source_uv * left_map.xy + left_map.zw;
+    float2 ru = source_uv * right_map.xy + right_map.zw;
+    bool lv = all(lu >= 0.0) && all(lu <= 1.0);
+    bool rv = all(ru >= 0.0) && all(ru <= 1.0);
+    float3 left = left_image.Sample(texture_sampler, saturate(lu)).rgb;
+    float3 right = right_image.Sample(texture_sampler, saturate(ru)).rgb;
+    float2 du = left_dominant > 0.5 ? lu : ru;
+    float w = smoothstep(0.0, 0.015, min(du.x, 1.0-du.x));
+    if (!lv && !rv) return float4(0,0,0,1);
+    if (!lv) return float4(right,1);
+    if (!rv) return float4(left,1);
+    return float4(left_dominant > 0.5 ? lerp(right,left,w) : lerp(left,right,w),1);
 }
 
 technique Draw
